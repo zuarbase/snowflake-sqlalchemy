@@ -9,7 +9,7 @@ from datetime import datetime
 import pytz
 from parameters import CONNECTION_PARAMETERS
 from snowflake.sqlalchemy import TIMESTAMP_LTZ, TIMESTAMP_NTZ, TIMESTAMP_TZ
-from sqlalchemy import Column, Integer, MetaData, Table
+from sqlalchemy import Column, Integer, MetaData, Table, DateTime
 from sqlalchemy.sql import select
 
 PST_TZ = "America/Los_Angeles"
@@ -33,7 +33,10 @@ def test_create_table_timestamp_datatypes(engine_testaccount):
         Column('id', Integer, primary_key=True),
         Column('tsntz', TIMESTAMP_NTZ),
         Column('tsltz', TIMESTAMP_LTZ),
-        Column('tstz', TIMESTAMP_TZ))
+        Column('tstz', TIMESTAMP_TZ),
+        Column('dttz', DateTime(timezone=True)),
+        Column('dtntz', DateTime(timezone=False))
+    )
     metadata.create_all(engine_testaccount)
     try:
         assert test_timestamp is not None
@@ -53,7 +56,10 @@ def test_inspect_timestamp_datatypes(engine_testaccount):
         Column('id', Integer, primary_key=True),
         Column('tsntz', TIMESTAMP_NTZ),
         Column('tsltz', TIMESTAMP_LTZ),
-        Column('tstz', TIMESTAMP_TZ))
+        Column('tstz', TIMESTAMP_TZ),
+        Column('dttz', DateTime(timezone=True)),
+        Column('dtntz', DateTime(timezone=False)),
+    )
     metadata.create_all(engine_testaccount)
     try:
         current_utctime = datetime.utcnow()
@@ -70,6 +76,8 @@ def test_inspect_timestamp_datatypes(engine_testaccount):
             tsntz=current_utctime,
             tsltz=current_localtime,
             tstz=current_localtime_with_other_tz,
+            dttz=current_localtime_with_other_tz,
+            dtntz=current_utctime,
         )
         results = engine_testaccount.execute(ins)
         results.close()
@@ -84,5 +92,7 @@ def test_inspect_timestamp_datatypes(engine_testaccount):
         assert rows[1] == current_utctime
         assert rows[2] == current_localtime
         assert rows[3] == current_localtime_with_other_tz
+        assert rows[4] == current_localtime_with_other_tz
+        assert rows[5] == current_utctime
     finally:
         test_timestamp.drop(engine_testaccount)
