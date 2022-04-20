@@ -4,8 +4,9 @@
 # Copyright (c) 2012-2019 Snowflake Computing Inc. All right reserved.
 #
 
+import enum
 import pytest
-from sqlalchemy import Column, ForeignKey, Integer, Sequence, String
+from sqlalchemy import Column, ForeignKey, Integer, Sequence, String, Enum, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import Session, relationship
 
@@ -16,12 +17,17 @@ def test_basic_orm(engine_testaccount):
     """
     Base = declarative_base()
 
+    class UserStatus(enum.Enum):
+        ACTIVE = "active",
+        INACTIVE = "inactive"
+
     class User(Base):
         __tablename__ = 'user'
 
         id = Column(Integer, Sequence('user_id_seq'), primary_key=True)
         name = Column(String)
         fullname = Column(String)
+        status = Column(Enum(UserStatus), default=UserStatus.ACTIVE)
 
         def __repr__(self):
             return "<User(%r, %r)>" % (self.name, self.fullname)
@@ -259,3 +265,48 @@ def test_schema_including_dot(engine_testaccount, db_parameters):
         'SELECT {db}."{schema}.{schema}".{db}.users.id'.format(
             db=db_parameters['database'].lower(),
             schema=db_parameters['schema'].lower()))
+
+
+def test_schema_translate_map(engine_testaccount, db_parameters, sql_compiler):
+    """
+    Test schema translate map execution option works replaces schema correctly
+    """
+    Base = declarative_base()
+
+    namespace = f"{db_parameters['database']}.{db_parameters['schema']}"
+    schema_map = 'A'
+
+    class User(Base):
+        __tablename__ = 'users'
+        __table_args__ = {
+            'schema': schema_map
+        }
+
+        id = Column(Integer, Sequence('user_id_orm_seq', schema=namespace),
+                    primary_key=True)
+        name = Column(String)
+        fullname = Column(String)
+
+    with engine_testaccount.connect().execution_options(
+            schema_translate_map={schema_map: db_parameters['schema']}) as con:
+        session = Session(bind=con)
+        Base.metadata.create_all(con)
+        try:
+            query = session.query(User)
+
+            # insert some data in a way that makes sure that we're working in the right testing schema
+            con.execute(text(f"insert into {db_parameters['schema']}.{User.__tablename__} values (0, 'testuser', 'test_user')"))
+
+            # assert the precompiled query contains the schema_map and not the actual schema
+            assert str(query).startswith(f'SELECT "{schema_map}".{User.__tablename__}')
+
+            # run query and see that schema translation was done corectly
+            results = query.all()
+            assert len(results) == 1
+            user = results.pop()
+            assert user.id == 0
+            assert user.name == "testuser"
+            assert user.fullname == "test_user"
+        finally:
+            Base.metadata.drop_all(con)
+

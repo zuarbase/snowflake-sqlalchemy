@@ -5,30 +5,46 @@
 #
 
 import operator
-from six.moves.urllib_parse import unquote_plus
+from functools import reduce
 
 import sqlalchemy.types as sqltypes
 from six import iteritems
-from sqlalchemy import util as sa_util
+from six.moves.urllib_parse import unquote_plus
+from snowflake.connector import errors as sf_errors
+from snowflake.connector.constants import UTF8
 from sqlalchemy import event as sa_vnt
-from functools import reduce
 from sqlalchemy import exc as sa_exc
-from sqlalchemy.sql.elements import quoted_name
-from sqlalchemy.schema import Table
+from sqlalchemy import util as sa_util
 from sqlalchemy.engine import default, reflection
+from sqlalchemy.schema import Table
+from sqlalchemy.sql import text
+from sqlalchemy.sql.elements import quoted_name
+from sqlalchemy.sql.sqltypes import String
 from sqlalchemy.types import (
-    CHAR, DATE, DATETIME, INTEGER, SMALLINT, BIGINT, DECIMAL, TIME, TIMESTAMP, VARCHAR, BINARY, BOOLEAN, FLOAT, REAL
+    BIGINT,
+    BINARY,
+    BOOLEAN,
+    CHAR,
+    DATE,
+    DATETIME,
+    DECIMAL,
+    FLOAT,
+    INTEGER,
+    REAL,
+    SMALLINT,
+    TIME,
+    TIMESTAMP,
+    VARCHAR,
 )
 
 from .base import (
-    SnowflakeDDLCompiler, SnowflakeCompiler, SnowflakeExecutionContext, SnowflakeIdentifierPreparer,
-    SnowflakeTypeCompiler
+    SnowflakeCompiler,
+    SnowflakeDDLCompiler,
+    SnowflakeExecutionContext,
+    SnowflakeIdentifierPreparer,
+    SnowflakeTypeCompiler,
 )
-from snowflake.connector.constants import UTF8
-from .custom_types import (
-    TIMESTAMP_LTZ, TIMESTAMP_TZ, TIMESTAMP_NTZ, VARIANT, OBJECT, ARRAY
-)
-from snowflake.connector import errors as sf_errors, ProgrammingError
+from .custom_types import ARRAY, OBJECT, TIMESTAMP_LTZ, TIMESTAMP_NTZ, TIMESTAMP_TZ, VARIANT, GEOGRAPHY
 
 colspecs = {}
 
@@ -66,6 +82,7 @@ ischema_names = {
     'VARIANT': VARIANT,
     'OBJECT': OBJECT,
     'ARRAY': ARRAY,
+    'GEOGRAPHY': GEOGRAPHY,
 }
 
 
@@ -74,6 +91,9 @@ class SnowflakeDialect(default.DefaultDialect):
     driver = 'snowflake'
     max_identifier_length = 65535
     cte_follows_insert = True
+
+    # TODO: support SQL caching, for more info see: https://docs.sqlalchemy.org/en/14/core/connections.html#caching-for-third-party-dialects
+    supports_statement_cache = False
 
     encoding = UTF8
     default_paramstyle = 'pyformat'
@@ -87,7 +107,7 @@ class SnowflakeDialect(default.DefaultDialect):
     #  unicode strings
     supports_unicode_statements = True
     supports_unicode_binds = True
-    returns_unicode_strings = True
+    returns_unicode_strings = String.RETURNS_UNICODE
     description_encoding = None
 
     # No lastrowid support. See SNOW-11155
@@ -188,8 +208,8 @@ class SnowflakeDialect(default.DefaultDialect):
         full_name = self._denormalize_quote_join(schema, object_name)
         try:
             results = connection.execute(
-                "DESC {0} /* sqlalchemy:_has_object */ {1}".format(
-                    object_type, full_name))
+                text("DESC {0} /* sqlalchemy:_has_object */ {1}".format(
+                    object_type, full_name)))
             row = results.fetchone()
             have = row is not None
             return have
@@ -227,10 +247,13 @@ class SnowflakeDialect(default.DefaultDialect):
 
     @reflection.cache
     def _current_database_schema(self, connection, **kw):
-        con = connection.connect().connection
-        return (
-            self.normalize_name(con.database),
-            self.normalize_name(con.schema))
+        # "branches" a connection if one exists, otherwise creates one
+        # branched connections use the same underlying DBAPI but maintain separate references
+        with connection.connect() as sqla_con:
+            dbapi_con = sqla_con.connection
+            return (
+                self.normalize_name(dbapi_con.database),
+                self.normalize_name(dbapi_con.schema))
 
     def _get_default_schema_name(self, connection):
         # NOTE: no cache object is passed here
@@ -254,9 +277,9 @@ class SnowflakeDialect(default.DefaultDialect):
 
     @reflection.cache
     def _get_schema_primary_keys(self, connection, schema, **kw):
-        result = connection.execute(
+        result = connection.execute(text(
             "SHOW /* sqlalchemy:_get_schema_primary_keys */PRIMARY KEYS IN SCHEMA {0}".format(schema)
-        )
+        ))
         ans = {}
         for row in result:
             table_name = self.normalize_name(row['table_name'])
@@ -279,16 +302,22 @@ class SnowflakeDialect(default.DefaultDialect):
 
     @reflection.cache
     def _get_schema_foreign_keys(self, connection, schema, **kw):
-        result = connection.execute(
+        _, current_schema = self._current_database_schema(connection, **kw)
+        result = connection.execute(text(
             "SHOW /* sqlalchemy:_get_schema_foreign_keys */ IMPORTED KEYS IN SCHEMA {0}".format(schema)
-        )
+        ))
         foreign_key_map = {}
         for row in result:
             name = self.normalize_name(row['fk_name'])
             if name not in foreign_key_map:
+                referred_schema = self.normalize_name(row['pk_schema_name'])
                 foreign_key_map[name] = {
                     'constrained_columns': [self.normalize_name(row['fk_column_name'])],
-                    'referred_schema': self.normalize_name(row['pk_schema_name']),
+                    # referred schema should be None in context where it doesn't need to be specified
+                    # https://docs.sqlalchemy.org/en/14/core/reflection.html#reflection-schema-qualified-interaction
+                    'referred_schema': (referred_schema
+                                        if referred_schema not in (self.default_schema_name, current_schema)
+                                        else None),
                     'referred_table': self.normalize_name(row['pk_table_name']),
                     'referred_columns': [self.normalize_name(row['pk_column_name'])],
                     'name': name,
@@ -326,7 +355,7 @@ class SnowflakeDialect(default.DefaultDialect):
         full_schema_name = self._denormalize_quote_join(current_database, schema)
         try:
             schema_primary_keys = self._get_schema_primary_keys(connection, full_schema_name, **kw)
-            result = connection.execute("""
+            result = connection.execute(text("""
             SELECT /* sqlalchemy:_get_schema_columns */
                    ic.table_name,
                    ic.column_name,
@@ -339,8 +368,8 @@ class SnowflakeDialect(default.DefaultDialect):
                    ic.is_identity,
                    ic.comment
               FROM information_schema.columns ic
-             WHERE ic.table_schema=%(table_schema)s
-             ORDER BY ic.ordinal_position""", {"table_schema": self.denormalize_name(schema)})
+             WHERE ic.table_schema=:table_schema
+             ORDER BY ic.ordinal_position"""), {"table_schema": self.denormalize_name(schema)})
         except sa_exc.ProgrammingError as pe:
             if pe.orig.errno == 90030:
                 # This means that there are too many tables in the schema, we need to go more granular
@@ -402,7 +431,7 @@ class SnowflakeDialect(default.DefaultDialect):
         current_database, _ = self._current_database_schema(connection, **kw)
         full_schema_name = self._denormalize_quote_join(current_database, schema)
         schema_primary_keys = self._get_schema_primary_keys(connection, full_schema_name, **kw)
-        result = connection.execute("""
+        result = connection.execute(text("""
         SELECT /* sqlalchemy:get_table_columns */
                ic.table_name,
                ic.column_name,
@@ -415,9 +444,9 @@ class SnowflakeDialect(default.DefaultDialect):
                ic.is_identity,
                ic.comment
           FROM information_schema.columns ic
-         WHERE ic.table_schema=%(table_schema)s
-           AND ic.table_name=%(table_name)s
-         ORDER BY ic.ordinal_position""", {"table_schema": self.denormalize_name(schema),
+         WHERE ic.table_schema=:table_schema
+           AND ic.table_name=:table_name
+         ORDER BY ic.ordinal_position"""), {"table_schema": self.denormalize_name(schema),
                                            "table_name": self.denormalize_name(table_name)})
         for (table_name,
              column_name,
@@ -489,12 +518,12 @@ class SnowflakeDialect(default.DefaultDialect):
         schema = schema or self.default_schema_name
         current_schema = schema
         if schema:
-            cursor = connection.execute(
+            cursor = connection.execute(text(
                 "SHOW /* sqlalchemy:get_table_names */ TABLES IN {0}".format(
-                    self._denormalize_quote_join(schema)))
+                    self._denormalize_quote_join(schema))))
         else:
-            cursor = connection.execute(
-                "SHOW /* sqlalchemy:get_table_names */ TABLES")
+            cursor = connection.execute(text(
+                "SHOW /* sqlalchemy:get_table_names */ TABLES"))
             _, current_schema = self._current_database_schema(connection)
 
         ret = [self.normalize_name(row[1]) for row in cursor]
@@ -508,12 +537,12 @@ class SnowflakeDialect(default.DefaultDialect):
         """
         schema = schema or self.default_schema_name
         if schema:
-            cursor = connection.execute(
+            cursor = connection.execute(text(
                 "SHOW /* sqlalchemy:get_view_names */ VIEWS IN {0}".format(
-                    self._denormalize_quote_join((schema))))
+                    self._denormalize_quote_join((schema)))))
         else:
-            cursor = connection.execute(
-                "SHOW /* sqlalchemy:get_view_names */ VIEWS")
+            cursor = connection.execute(text(
+                "SHOW /* sqlalchemy:get_view_names */ VIEWS"))
 
         return [self.normalize_name(row[1]) for row in cursor]
 
@@ -524,16 +553,16 @@ class SnowflakeDialect(default.DefaultDialect):
         """
         schema = schema or self.default_schema_name
         if schema:
-            cursor = connection.execute(
+            cursor = connection.execute(text(
                 "SHOW /* sqlalchemy:get_view_definition */ VIEWS "
                 "LIKE '{0}' IN {1}".format(
                     self._denormalize_quote_join(view_name),
-                    self._denormalize_quote_join(schema)))
+                    self._denormalize_quote_join(schema))))
         else:
-            cursor = connection.execute(
+            cursor = connection.execute(text(
                 "SHOW /* sqlalchemy:get_view_definition */ VIEWS "
                 "LIKE '{0}'".format(
-                    self._denormalize_quote_join(view_name)))
+                    self._denormalize_quote_join(view_name))))
 
         n2i = self.__class__._map_name_to_idx(cursor)
         try:
@@ -547,13 +576,13 @@ class SnowflakeDialect(default.DefaultDialect):
     def get_temp_table_names(self, connection, schema=None, **kw):
         schema = schema or self.default_schema_name
         if schema:
-            cursor = connection.execute(
+            cursor = connection.execute(text(
                 "SHOW /* sqlalchemy:get_temp_table_names */ TABLES "
                 "IN {0}".format(
-                    self._denormalize_quote_join(schema)))
+                    self._denormalize_quote_join(schema))))
         else:
-            cursor = connection.execute(
-                "SHOW /* sqlalchemy:get_temp_table_names */ TABLES")
+            cursor = connection.execute(text(
+                "SHOW /* sqlalchemy:get_temp_table_names */ TABLES"))
 
         ret = []
         n2i = self.__class__._map_name_to_idx(cursor)
@@ -567,8 +596,8 @@ class SnowflakeDialect(default.DefaultDialect):
         """
         Gets all schema names.
         """
-        cursor = connection.execute(
-            "SHOW /* sqlalchemy:get_schema_names */ SCHEMAS")
+        cursor = connection.execute(text(
+            "SHOW /* sqlalchemy:get_schema_names */ SCHEMAS"))
 
         return [self.normalize_name(row[1]) for row in cursor]
 
@@ -581,7 +610,7 @@ class SnowflakeDialect(default.DefaultDialect):
                                         table_name,
                                         (' IN SCHEMA {}'.format(self.normalize_name(schema))) if schema else ''
                                     )
-        cursor = connection.execute(sql_command)
+        cursor = connection.execute(text(sql_command))
         return cursor.fetchone()
 
     def _get_view_comment(self, connection, table_name, schema=None, **kw):
@@ -593,7 +622,7 @@ class SnowflakeDialect(default.DefaultDialect):
                 table_name,
                 (' IN SCHEMA {}'.format(self.normalize_name(schema))) if schema else ''
             )
-        cursor = connection.execute(sql_command)
+        cursor = connection.execute(text(sql_command))
         return cursor.fetchone()
 
     def get_table_comment(self, connection, table_name, schema=None, **kw):
